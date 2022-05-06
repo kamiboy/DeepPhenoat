@@ -1,6 +1,3 @@
-#A program training AI prediction models based on binary phenotypes and specified genotypes
-#Camous Moslemi, 05.04.2022
-
 import os
 from os.path import exists
 from datetime import datetime
@@ -14,7 +11,7 @@ import torch.nn.functional as F
 from bedbug import BEDBUG
 from bedbug import Variant
 
-version = 3.5
+version = 3.6
 
 perform_training = False
 perform_prediction = True
@@ -23,7 +20,7 @@ perform_prediction = True
 resume = False
 
 #Extend will increase the considered genomic area by the extension number of basepairs up and downstream of provided locus
-extend = True
+extend = False
 extension = 20000
 
 #Activate MLP or AEC training or preiction
@@ -31,6 +28,8 @@ MLP = True
 AEC = True
 
 #dataset split for training and validation, test set will be total - (train + validate) if train and validation add to to 1 then test will just be validation
+#smart splitting will attempt to split up unique genotypes for training and validation, if disabled the splitting will be random
+smart_splitting = False
 data_rate_train = 0.75
 data_rate_validate = 0.25
 
@@ -38,14 +37,16 @@ data_rate_validate = 0.25
 limitHours = False
 maxTrainingHours = 24
 
-#An accuracy threshold below which model training is considered stuck in a saddle point if not surpassed after a set amount of epochs, traiggering restart
+#An accuracy threshold below which model training is considered stuck in a saddle point if not surpassed after a set amount of epochs, triggering restart
 saddle_accuracy = 0.9
 min_accuracy = 0.92
-min_restarts_mlp = 5
-max_restarts = 15
-retries_mlp = 100
-retries_aec = 15
-
+min_restarts_mlp = 10
+max_restarts = 20
+retries_mlp = 150
+saddle_epochs_mlp = 50
+retries_aec = 20
+saddle_epochs_aec = 10
+batch_size_mlp = 8
 #the factor with which to reduce AEC model Autoencoder bottleneck relative to input/output, and a minumum acceptable dimension
 dim_factor = 0.05
 min_dim = 4
@@ -56,15 +57,18 @@ min_hid = 4
 #A list of phenotypes to be skipped for training or predicting
 skipped = []
 
+#match A/B variants with A/! renamed alternatives (experimental)
+match_renamed_variant = False
+
 #folder where bed/bim/fam genotype files are stored
 snpdir = '/snpdir/'
 
 #If each chromosome is in a separate bed file
-#chr_file = '20210503_chr'
-#chr_file_postfix = '_CVD_FINAL'
+chr_file = 'chr'
+chr_file_postfix = '_genotypes'
 #If all chromosomes are in one bed file
-chr_file = 'CVD_GSA_FINAL'
-chr_file_postfix = None
+#chr_file = 'all_genortypes'
+#chr_file_postfix = None
 
 #directory where all data files except for genotypes are loaded from and written to
 workdir = '/workdir/'
@@ -74,7 +78,7 @@ phenotypes_info_file = 'phenotypes.info.tsv'
 phenotypes_file = 'phenotypes.tsv'
 
 class Progress:
-    def __init__(self, iterations, steps = 20):
+    def __init__(self, iterations, steps = 25):
         self.steps = steps
         self.progress = 0
         self.iterations = iterations
@@ -163,9 +167,6 @@ class AIDataset(Dataset):
         else:
             print('Loading genotypes for predicting %s phenotypes'%(phenotype))
 
-        #bed = BEDBUG('/data/preprocessed/genetics/dbds_freeze_20210503/DBDS_GSA_FINAL')
-        #bed = BEDBUG('/data/preprocessed/genetics/chb_cvd_freeze_20210503/CVD_GSA_FINAL')
-
         first = True
         for locus in loci:
             locus = locus.split(':')
@@ -173,7 +174,7 @@ class AIDataset(Dataset):
             locus = locus[1].split('-')
             start = int(locus[0])
             end = int(locus[1])
-            if extend:
+            if extend or not self.train_mode:
                 start = start - extension
                 end = end + extension
                 if start < 0:
@@ -209,7 +210,9 @@ class AIDataset(Dataset):
             cases = self.cases
 
             self.variants = []
+            missing_variants = open(specific_variants+'.missing','w')
             specific_variants = open(specific_variants,'r')
+            missing_variants.write('chr\tpos\tallele1\tallele2\n')
             added = [False]*len(variants)
             data = []
             header = True
@@ -224,8 +227,15 @@ class AIDataset(Dataset):
                 pos = int(items[1])
                 allele1 = items[2]
                 allele2 = items[3]
+                if len(items) > 4:
+                    maf = float(items[4])
+                else:
+                    maf = float('nan')
 
                 found = False
+                alternate = -1
+                renamed_allele1 = -1
+                renamed_allele2 = -1
                 for index in range(len(variants)):
                     if added[index]:
                         continue
@@ -236,14 +246,48 @@ class AIDataset(Dataset):
                         added[index] = True
                         self.variants.append(variants[index])
                         break
-
+                    elif variants[index].chr == chr and variants[index].pos == pos and variants[index].allele1 == allele2 and variants[index].allele2 == allele1:
+                        alternate = index
+                    elif variants[index].chr == chr and variants[index].pos == pos and variants[index].allele1 == allele1 and variants[index].allele2 == '!':
+                        renamed_allele1 = index
+                    elif variants[index].chr == chr and variants[index].pos == pos and variants[index].allele1 == allele2 and variants[index].allele2 == '!':
+                        renamed_allele2 = index
                 if not found:
-                    print('Warning: %s variant %s:%i%s/%s not found, this could reduce prediction accuracy'%(phenotype,chr,pos,allele1,allele2))
-                    missing += 1
-                    if not self.train_mode:
-                        data += [-1]*len(cases)
-                        self.variants.append(Variant(None,chr,pos,allele1,allele2))
+                    if alternate != -1:
+                        index = alternate
+                        genos = genotypes[index*len(cases):(index+1)*len(cases)]
+                        for i in range(len(genos)):
+                            g = genos[i]
+
+                            if g == 0:
+                                genos[i] = 2
+                            elif g == 2:
+                                genos[i] = 0
+
+                        data += genos
+                        added[index] = True
+                        variants[index].allele1 = allele1
+                        variants[index].allele2 = allele2
+                        variants[index].maf = 1-variants[index].maf
+                        self.variants.append(variants[index])
+                    elif match_renamed_variant and renamed_allele1 != -1 and renamed_allele2 != -1:
+                        index = renamed_allele1
+                        print('Achtung: %s variant %s:%d %s/%s (maf=%.2f) alternate %s/! (maf=%.2f) is being used!'%(phenotype,chr,pos,allele1,allele2,maf,variants[index].allele1,variants[index].maf ))
+                        data += genotypes[index*len(cases):(index+1)*len(cases)]
+                        found = True
+                        added[index] = True
+                        variants[index].allele1 = allele1
+                        variants[index].allele2 = allele2
+                        self.variants.append(variants[index])
+                    else:
+                        print('Warning: %s variant %s:%d %s/%s not found, this could reduce prediction accuracy'%(phenotype,chr,pos,allele1,allele2))
+                        missing_variants.write('%s\t%d\t%s\t%s\n'%(chr,pos,allele1,allele2))
+                        missing += 1
+                        if not self.train_mode:
+                            data += [-1]*len(cases)
+                            self.variants.append(Variant(None,chr,pos,allele1,allele2))
             specific_variants.close()
+            missing_variants.close()
 
             print('Found %i/%i (%.2f%%) specified variants in dataset'%(len(self.variants)-missing,len(self.variants), (len(self.variants)-missing)*100/len(self.variants)))
             del(genotypes)
@@ -445,7 +489,7 @@ class AIDataset(Dataset):
         adjustment = 0.0
         good_split = False
         attempt = 0
-        max_attempts = 1000
+        max_attempts = 200
         failed = False
         while not failed and not good_split and attempt < max_attempts:
             if complete_pos_rate >= train_rate+adjustment or complete_neg_rate >= train_rate+adjustment:
@@ -476,8 +520,12 @@ class AIDataset(Dataset):
                 train_set = set(poshash[0:train_pos_len]) | self.completeposhash | set(neghash[0:train_neg_len]) | self.completeneghash
             else:
                 train_set = set(poshash[0:train_pos_len]) | set(neghash[0:train_neg_len])
-            validate_set = set(poshash[train_pos_len:train_pos_len+validate_pos_len]) | set(neghash[train_neg_len:train_neg_len+validate_neg_len])
-            test_set = set(poshash[train_pos_len+validate_pos_len:]) | set(poshash[train_neg_len+validate_neg_len:])
+            if train_rate + validate_rate < 1:
+                validate_set = set(poshash[train_pos_len:train_pos_len+validate_pos_len]) | set(neghash[train_neg_len:train_neg_len+validate_neg_len])
+                test_set = set(poshash[train_pos_len+validate_pos_len:]) | set(poshash[train_neg_len+validate_neg_len:])
+            else:
+                validate_set = set(poshash[train_pos_len:]) | set(neghash[train_neg_len:])
+                test_set = set()
 
             train_indices = []
             validate_indices = []
@@ -541,14 +589,14 @@ class AIDataset(Dataset):
                 print('Warning: Dataset split (%.2f/%.2f/%.2f) is bad, trying again'%( final_train_rate/(final_train_rate+final_validate_rate+final_test_rate),final_validate_rate/(final_train_rate+final_validate_rate+final_test_rate),final_test_rate/(final_train_rate+final_validate_rate+final_test_rate) ))
                 attempt += 1
 
-        if final_train_rate == 0 or final_validate_rate == 0 or (final_test_rate == 0 and train_rate + validate_rate < 1 ):
-            return None, None, None
-        elif not good_split:
+        if not good_split or final_train_rate == 0 or final_validate_rate == 0 or (final_test_rate == 0 and train_rate + validate_rate < 1 ):
             print('Warning: Final dataset split is bad, this might impact training!')
+            return None, None, None
 
         print("Training set total: %d (%.2f), (+) %d (%.2f), (-) %d (%.2f)"%(len(train_indices), len(train_indices) / self.data.shape[0],nTrainPos,nTrainPos/(nTrainPos+nTrainNeg),nTrainNeg,nTrainNeg/(nTrainPos+nTrainNeg)))
         print("Validation set total: %d (%.2f), (+) %d (%.2f), (-) %d (%.2f)"%(len(validate_indices), len(validate_indices) / self.data.shape[0],nValidatePos,nValidatePos/(nValidatePos+nValidateNeg),nValidateNeg,nValidateNeg/(nValidatePos+nValidateNeg)))
-        print("Testing set total: %d (%.2f), (+) %d (%.2f), (-) %d (%.2f)"%(len(test_indices),len(test_indices) / self.data.shape[0],nTestPos,nTestPos/(nTestPos+nTestNeg),nTestNeg,nTestNeg/(nTestPos+nTestNeg)))
+        if nTestPos+nTestNeg > 0:
+            print("Testing set total: %d (%.2f), (+) %d (%.2f), (-) %d (%.2f)"%(len(test_indices),len(test_indices) / self.data.shape[0],nTestPos,nTestPos/(nTestPos+nTestNeg),nTestNeg,nTestNeg/(nTestPos+nTestNeg)))
         
         train_set = torch.utils.data.Subset(self,train_indices)
         validate_set = torch.utils.data.Subset(self,validate_indices)
@@ -702,10 +750,11 @@ class DeepPhenoat:
         best_loss = float('inf')
 
         while restarts <= min_restarts_mlp or (restarts < max_restarts and best_accuracy < min_accuracy):
-            train_set, valid_set, test_set = dataset.split(data_rate_train,data_rate_validate, False)
+            if smart_splitting:
+                train_set, valid_set, test_set = dataset.split(data_rate_train,data_rate_validate, False)
 
-            if train_set == None:
-                print('Achtung: Smart MLP dataset split for %s failed, resorting to simple random splitting!'%phenotype)
+            if not smart_splitting or train_set == None:
+                print('Achtung: Smart MLP dataset split for %s failed or disabled, resorting to simple random splitting!'%phenotype)
 
                 nTrain_set = int(dataset.nCases()*data_rate_train)
                 nValid_set = int(dataset.nCases()*data_rate_validate)
@@ -713,7 +762,7 @@ class DeepPhenoat:
                 if data_rate_train+data_rate_validate < 1:
                     train_set, valid_set, test_set = random_split(dataset,[nTrain_set,nValid_set,nTest_set])
                 else:
-                    train_set, valid_set = random_split(dataset,[nTrain_set,nValid_set])
+                    train_set, valid_set = random_split(dataset,[nTrain_set,dataset.nCases()-nTrain_set])
                     test_set = valid_set
                 print('Training set: %d (%.2f)'%(len(train_set), len(train_set)/dataset.nCases()) )
                 print('Validation set: %d (%.2f)'%(len(valid_set), len(valid_set)/dataset.nCases()) )
@@ -721,11 +770,6 @@ class DeepPhenoat:
 
             if test_set == None:
                 test_set = valid_set
-
-            train_loader = DataLoader(train_set,batch_size=1,shuffle=True)
-            valid_loader = DataLoader(valid_set,batch_size=10,shuffle=True)
-            test_loader  = DataLoader(test_set,batch_size=10,shuffle=True)
-
 
             nhid = int(round(dataset.nVariants()*hid_factor))
             if nhid < min_hid:
@@ -748,10 +792,6 @@ class DeepPhenoat:
             #retries = 75
             attempt = 0
             #best_mlp = mlp.state_dict().copy()
-            TP = 0
-            TN = 0
-            FP = 0
-            FN = 0
 
             print('Training...')
             t_start = datetime.timestamp(datetime.now())
@@ -760,6 +800,12 @@ class DeepPhenoat:
                 epLoss = 0
                 counter = 0
                 mlp.train()
+                batch_size = batch_size_mlp
+
+                if len(train_set) < 25000 and (dataset.pos_rate() >= 0.95 or dataset.pos_rate() <= 0.5):
+                    batch_size = len(train_set)
+
+                train_loader = DataLoader(train_set,batch_size=batch_size,shuffle=True)
                 for x_raw, _, x_phenotype in train_loader:
                     #weight = np.full_like(x_phenotype, dataset.pos_weight())
                     #weight[x_phenotype == 0.0] = 1.0/dataset.pos_weight()
@@ -773,9 +819,14 @@ class DeepPhenoat:
                     counter += x_raw.size(0)
                 trLoss.append(epLoss/counter)
                 #Validate
+                TP = 0
+                TN = 0
+                FP = 0
+                FN = 0
                 epLoss = 0
                 counter = 0
                 mlp.eval()
+                valid_loader = DataLoader(valid_set,batch_size=64,shuffle=True)
                 for x_raw, _, x_phenotype in valid_loader:
                     #weight = np.full_like(x_phenotype, dataset.pos_weight())
                     #weight[x_phenotype == 0.0] = 1.0/dataset.pos_weight()
@@ -807,8 +858,9 @@ class DeepPhenoat:
 
                 if epoch == 0:
                     initial_accuracy = accuracy
+                    initial_loss = vlLoss[-1]
 
-                if (TP > 0 and TN > 0) and (accuracy >= best_accuracy or (round(accuracy,4) == round(best_accuracy,4) and vlLoss[-1] < best_loss)):
+                if (TP > 0 and TN > 0) and ((accuracy >= best_accuracy or (round(accuracy,4) == round(best_accuracy,4) and vlLoss[-1] < best_loss))):
                     best_loss = vlLoss[-1]
                     best_accuracy = accuracy
                     best_mlp = mlp.state_dict().copy()
@@ -837,9 +889,9 @@ class DeepPhenoat:
                         est = est - (mins * 60)
 
                     secs = int(est)
-                    print('Epoch: %03d, Attempt: %03d, Epoch length: %dh:%dm:%d:s, Tr.Loss: %.8f, Vl.Loss: %.8f, Vl.Acc: %.8f'%(epoch,attempt,hours,mins,secs,trLoss[-1],vlLoss[-1], accuracy))
+                    print('Epoch: %03d, Attempt: %03d, Epoch length: %dh:%dm:%d:s, CM(%d|%d|%d|%d), Tr.Loss: %.8f, Vl.Loss: %.8f, Vl.Acc: %.8f'%(epoch,attempt,hours,mins,secs,TP,TN,FP,FN,trLoss[-1],vlLoss[-1], accuracy))
 
-                if epoch >= 40 and accuracy < saddle_accuracy and best_accuracy - initial_accuracy < 0.01:
+                if len(dataset) > 10000 and epoch >= saddle_epochs_mlp and accuracy < saddle_accuracy and best_accuracy - initial_accuracy < 0.01 and  initial_loss - vlLoss[-1] < 0.05:
                     print('Warning: %s model training seems to be stuck inside saddle point, trying again!'%(phenotype))
                     break
 
@@ -866,7 +918,7 @@ class DeepPhenoat:
         TN = 0
         FP = 0
         FN = 0
-
+        test_loader  = DataLoader(test_set,batch_size=64,shuffle=True)
         for x_raw, _, x_phenotype in test_loader:
             with torch.no_grad():
                 x_classified = mlp(x_raw)
@@ -917,9 +969,9 @@ class DeepPhenoat:
         print('achieved accuracy: %.4f'%accuracy)
 
         if TP == 0:
-            print('Achtung: %s model has a recall rate of 0 and is therefore invalid.')
+            print('Achtung: %s model has a recall rate of 0 and is therefore invalid.'%phenotype)
         if TN == 0:
-            print('Achtung: %s model has a specificity rate of 0 and is therefore invalid.')
+            print('Achtung: %s model has a specificity rate of 0 and is therefore invalid.'%phenotype)
 
         out = open(workdir+'AI.evaluation.training.mlp', "a")
         out.write('%s\t%i\t%i\t%i\t%i\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%i\t%i\t%.8f\n'%(phenotype,TP,TN,FP,FN,recall,specificity,PPV,NPV,accuracy,fscore,dataset.nCases(),dataset.nVariants(),rate))
@@ -940,17 +992,18 @@ class DeepPhenoat:
         best_loss = float('inf')
 
         while not abort and restarts < max_restarts and round(best_accuracy,2) + 0.01 < round(min_accuracy,2):
-            train_set, valid_set, test_set = dataset.split(data_rate_train,data_rate_validate, True)
+            if smart_splitting:
+                train_set, valid_set, test_set = dataset.split(data_rate_train,data_rate_validate, True)
 
-            if train_set == None:
-                print('Achtung: Smart AEC dataset split for %s failed, resorting to simple random splitting!'%phenotype)
+            if not smart_splitting or train_set == None:
+                print('Achtung: Smart AEC dataset split for %s failed or disabled, resorting to simple random splitting!'%phenotype)
                 nTrain_set = int(dataset.nCases()*data_rate_train)
                 nValid_set = int(dataset.nCases()*data_rate_validate)
                 nTest_set = dataset.nCases() - nTrain_set - nValid_set
                 if data_rate_train+data_rate_validate < 1:
                     train_set, valid_set, test_set = random_split(dataset,[nTrain_set,nValid_set,nTest_set])
                 else:
-                    train_set, valid_set = random_split(dataset,[nTrain_set,nValid_set])
+                    train_set, valid_set = random_split(dataset,[nTrain_set,dataset.nCases()-nTrain_set])
                     test_set = valid_set
                 print('Training set: %d (%.2f)'%(len(train_set), len(train_set)/dataset.nCases()) )
                 print('Validation set: %d (%.2f)'%(len(valid_set), len(valid_set)/dataset.nCases()) )
@@ -988,8 +1041,8 @@ class DeepPhenoat:
                 inflation_factor_train_phase1 = 3
                 inflation_factor_train_phase2 = 2
             else:
-                inflation_factor_train_phase1 = 10
-                inflation_factor_train_phase2 = 5
+                inflation_factor_train_phase1 = 5
+                inflation_factor_train_phase2 = 2
 
             inflation_factor_validate = 2
             epochs = 1000
@@ -1001,10 +1054,10 @@ class DeepPhenoat:
             t_start = datetime.timestamp(datetime.now())
             for epoch in range(epochs):
                 #Train phase1
-                train_loader = DataLoader(train_set,batch_size=1,shuffle=True)
                 epLoss = 0
                 counter = 0
                 model.train()
+                train_loader = DataLoader(train_set,batch_size=1,shuffle=True)
                 for _ in range(0,inflation_factor_train_phase1):
                     for x_raw, x_mutated, x_phenotype in train_loader:
                         if int(x_raw.min()) < 0:
@@ -1030,7 +1083,7 @@ class DeepPhenoat:
                         counter += x_raw.size(0)
 
                 #Train phase2
-                train_loader = DataLoader(train_set,batch_size=2,shuffle=True)
+                train_loader = DataLoader(train_set,batch_size=32,shuffle=True)
                 for _ in range(0,inflation_factor_train_phase2):
                     for x_raw, x_mutated, x_phenotype in train_loader:
                         x_imputed,x_classified = model(x_mutated)
@@ -1055,7 +1108,7 @@ class DeepPhenoat:
                 FP = 0
                 FN = 0
                 model.eval()
-                valid_loader = DataLoader(valid_set,batch_size=10,shuffle=True)
+                valid_loader = DataLoader(valid_set,batch_size=64,shuffle=True)
                 for _ in range(0,inflation_factor_validate):
                     for x_raw, x_mutated, x_phenotype in valid_loader:
                         with torch.no_grad():
@@ -1088,7 +1141,7 @@ class DeepPhenoat:
                 if epoch == 0:
                     initial_accuracy = accuracy
 
-                if (TP > 0 and TN > 0) and (accuracy > best_accuracy or (round(accuracy,4) == round(best_accuracy,4) and vlLoss[-1] < best_loss)):
+                if (TP > 0 and TN > 0) and ((accuracy > best_accuracy or (round(accuracy,4) == round(best_accuracy,4) and vlLoss[-1] < best_loss))):
                     best_loss = vlLoss[-1]
                     best_accuracy = accuracy
 
@@ -1104,7 +1157,7 @@ class DeepPhenoat:
                         print('Epoch: %03d, max retries reached, stopping'%(epoch))
                         break
 
-                if epoch >= 4 and accuracy < saddle_accuracy and best_accuracy - initial_accuracy < 0.01:
+                if len(dataset) > 10000 and epoch >= saddle_epochs_aec and accuracy < saddle_accuracy and best_accuracy - initial_accuracy < 0.01:
                     print('Warning: %s model training seems to be stuck inside saddle point, trying again!'%(phenotype))
                     break
 
@@ -1122,7 +1175,7 @@ class DeepPhenoat:
                     est = est - (mins * 60)
 
                 secs = int(est)
-                print('Epoch: %03d, Attempt: %03d, Epoch length: %dh:%dm:%d:s, Tr.Loss: %.8f, Vl.Loss: %.8f, Vl.Acc: %.8f'%(epoch,attempt,hours,mins,secs,trLoss[-1],vlLoss[-1], accuracy))
+                print('Epoch: %03d, Attempt: %03d, Epoch length: %dh:%dm:%d:s, CM(%d|%d|%d|%d), Tr.Loss: %.8f, Vl.Loss: %.8f, Vl.Acc: %.8f'%(epoch,attempt,hours,mins,secs,TP,TN,FP,FN,trLoss[-1],vlLoss[-1], accuracy))
                 if (limitHours and datetime.timestamp(datetime.now()) - t_start) / (60*60) > maxTrainingHours:
                     print('Training %s has surpassed %i hours, stopping early'%(phenotype,maxTrainingHours))
                     abort = True
@@ -1151,7 +1204,7 @@ class DeepPhenoat:
         FP = 0
         FN = 0
 
-        test_loader = DataLoader(test_set,batch_size=10,shuffle=False)
+        test_loader = DataLoader(test_set,batch_size=64,shuffle=False)
         for (x_raw, _, x_phenotype) in test_loader:
             with torch.no_grad():
                 _, x_classified=model(x_raw)
@@ -1234,10 +1287,11 @@ class DeepPhenoat:
                 x_class = model(x_genotype)
             else:
                 _, x_class = model(x_genotype)
-            x_class = x_class.squeeze(1).detach().numpy().round()
+            x_class_raw = x_class.squeeze(1).detach().numpy()
+            x_class = x_class_raw.round()
             for index in range(len(x_id)):
                 progress.step()
-                file.write('%s\t%i\n'%(x_id[index],x_class[index]))
+                file.write('%s\t%i\t%f\n'%(x_id[index],x_class[index],x_class_raw[index]))
                 predictions += 1
                 if x_id[index] in self.cases:
                     case = self.cases[x_id[index]]
@@ -1327,10 +1381,11 @@ class DeepPhenoat:
                     predictions = workdir + 'AI.predictions.%s.mlp'%phenotype
                     params = workdir + 'AI.params.%s.mlp'%phenotype
                     if not exists(variants) or not exists(params) or not exists(workdir+'AI.model.%s.mlp'%phenotype):
-                        print('Error: %s lacks necessary MLP model files, cannot perform prediction!'%phenotype)
+                        print('Achtung: %s lacks necessary MLP model files, cannot perform prediction!'%phenotype)
                     elif resume and exists(predictions):
                         print('%s MLP predictions already exist, skipping!'%phenotype)
                     else:
+                        print('\nMLP %s prediction:'%phenotype)
                         params = open(params)
                         params.readline()
                         params = params.readline().rstrip().split('\t')
@@ -1342,7 +1397,7 @@ class DeepPhenoat:
                         model.eval()
                         dataset = AIDataset(phenotype, loci, None, None,0,1,variants)
                         predictions = open(predictions,'w')
-                        predictions.write('ID\t%s\n'%phenotype)
+                        predictions.write('ID\t%s\t%s.raw\n'%(phenotype,phenotype))
                         print('Predicting MLP phenotypes for %s...'%phenotype)
                         predictions = self.generate(phenotype, model, dataset, predictions,'mlp')
                         print('Generated %i predictions using MLP model: %s'%(predictions,phenotype))
@@ -1352,10 +1407,11 @@ class DeepPhenoat:
                     predictions = workdir + 'AI.predictions.%s.aec'%phenotype
                     params = workdir + 'AI.params.%s.aec'%phenotype
                     if not exists(variants) or not exists(params) or not exists(workdir+'AI.model.%s.aec'%phenotype):
-                        print('Error: %s lacks necessary AEC model files, cannot perform prediction!'%phenotype)
+                        print('Achtung: %s lacks necessary AEC model files, cannot perform prediction!'%phenotype)
                     elif resume and exists(predictions):
                         print('%s AEC predictions already exist, skipping!'%phenotype)
                     else:
+                        print('\nAEC %s prediction:'%phenotype)
                         params = open(params)
                         params.readline()
                         params = params.readline().rstrip().split('\t')
@@ -1367,7 +1423,7 @@ class DeepPhenoat:
                         model.eval()
                         dataset = AIDataset(phenotype, loci,None, None,0,1,variants)
                         predictions = open(predictions,'w')
-                        predictions.write('ID\t%s\n'%phenotype)
+                        predictions.write('ID\t%s\t%s.raw\n'%(phenotype,phenotype))
                         print('Predicting AEC phenotypes for %s...'%phenotype)
                         predictions = self.generate(phenotype, model, dataset, predictions,'aec')
                         print('Generated %i predictions using AEC model: %s'%(predictions,phenotype))
