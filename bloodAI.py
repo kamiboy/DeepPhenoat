@@ -11,13 +11,19 @@ import torch.nn.functional as F
 from bedbug import BEDBUG
 from bedbug import Variant
 
-version = 3.6
+version = 3.7
 
 perform_training = False
 perform_prediction = True
 
 #Pick up from where the work was left off
 resume = False
+
+#Fix for weird non-standard way deCODE names triallelic variants so they can be matched with standard nomeclature everyones else uses 
+triallelic_fix = True
+
+#match A/B variants with A/! renamed alternatives (experimental)
+#match_renamed_variant = True
 
 #Extend will increase the considered genomic area by the extension number of basepairs up and downstream of provided locus
 extend = False
@@ -28,8 +34,7 @@ MLP = True
 AEC = True
 
 #dataset split for training and validation, test set will be total - (train + validate) if train and validation add to to 1 then test will just be validation
-#smart splitting will attempt to split up unique genotypes for training and validation, if disabled the splitting will be random
-smart_splitting = False
+smart_splitting = True
 data_rate_train = 0.75
 data_rate_validate = 0.25
 
@@ -37,16 +42,16 @@ data_rate_validate = 0.25
 limitHours = False
 maxTrainingHours = 24
 
-#An accuracy threshold below which model training is considered stuck in a saddle point if not surpassed after a set amount of epochs, triggering restart
+#An accuracy threshold below which model training is considered stuck in a saddle point if not surpassed after a set amount of epochs, traiggering restart
 saddle_accuracy = 0.9
 min_accuracy = 0.92
-min_restarts_mlp = 10
-max_restarts = 20
-retries_mlp = 150
-saddle_epochs_mlp = 50
-retries_aec = 20
-saddle_epochs_aec = 10
-batch_size_mlp = 8
+min_restarts_mlp = 5
+max_restarts = 15
+retries_mlp = 100
+saddle_epochs_mlp = 25
+retries_aec = 8
+saddle_epochs_aec = 4
+batch_size_mlp = 32
 #the factor with which to reduce AEC model Autoencoder bottleneck relative to input/output, and a minumum acceptable dimension
 dim_factor = 0.05
 min_dim = 4
@@ -56,9 +61,6 @@ min_hid = 4
 
 #A list of phenotypes to be skipped for training or predicting
 skipped = []
-
-#match A/B variants with A/! renamed alternatives (experimental)
-match_renamed_variant = False
 
 #folder where bed/bim/fam genotype files are stored
 snpdir = '/snpdir/'
@@ -167,6 +169,9 @@ class AIDataset(Dataset):
         else:
             print('Loading genotypes for predicting %s phenotypes'%(phenotype))
 
+        #bed = BEDBUG('/data/preprocessed/genetics/dbds_freeze_20210503/DBDS_GSA_FINAL')
+        #bed = BEDBUG('/data/preprocessed/genetics/chb_cvd_freeze_20210503/CVD_GSA_FINAL')
+
         first = True
         for locus in loci:
             locus = locus.split(':')
@@ -234,8 +239,8 @@ class AIDataset(Dataset):
 
                 found = False
                 alternate = -1
-                renamed_allele1 = -1
-                renamed_allele2 = -1
+                #renamed_allele1 = -1
+                #renamed_allele2 = -1
                 for index in range(len(variants)):
                     if added[index]:
                         continue
@@ -248,12 +253,36 @@ class AIDataset(Dataset):
                         break
                     elif variants[index].chr == chr and variants[index].pos == pos and variants[index].allele1 == allele2 and variants[index].allele2 == allele1:
                         alternate = index
-                    elif variants[index].chr == chr and variants[index].pos == pos and variants[index].allele1 == allele1 and variants[index].allele2 == '!':
-                        renamed_allele1 = index
-                    elif variants[index].chr == chr and variants[index].pos == pos and variants[index].allele1 == allele2 and variants[index].allele2 == '!':
-                        renamed_allele2 = index
+                    #elif variants[index].chr == chr and variants[index].pos == pos and variants[index].allele1 == allele1 and variants[index].allele2 == '!':
+                    #    renamed_allele1 = index
+                    #elif variants[index].chr == chr and variants[index].pos == pos and variants[index].allele1 == allele2 and variants[index].allele2 == '!':
+                    #    renamed_allele2 = index
                 if not found:
-                    if alternate != -1:
+                    triallelic = False
+                    if alternate == -1 and triallelic_fix:
+                        for index in range(len(variants)):
+                            #if added[index]:
+                            #    continue
+
+                            if variants[index].chr == chr and variants[index].pos == pos and ((variants[index].allele1 == allele1 and (variants[index].allele2 == '!' or allele2 == '!')) or (variants[index].allele2 == allele2 and (variants[index].allele1 == '!' or allele1 == '!'))):
+                                print('Achtung: %s triallelic variant %s:%i%s/%s matched with %s:%i%s/%s'%(phenotype,chr,pos,allele1,allele2, variants[index].chr, variants[index].pos, variants[index].allele1, variants[index].allele2))
+                                data += genotypes[index*len(cases):(index+1)*len(cases)]
+                                found = True
+                                added[index] = True
+                                if variants[index].allele1 == '!':
+                                    variants[index].allele1 = allele1
+                                elif variants[index].allele2 == '!':
+                                    variants[index].allele2 = allele2
+
+                                self.variants.append(variants[index])
+                                break
+                            elif variants[index].chr == chr and variants[index].pos == pos and ((variants[index].allele1 == allele2 and (variants[index].allele2 == '!' or allele1 == '!')) or (variants[index].allele2 == allele1 and (variants[index].allele1 == '!' or allele2 == '!'))):
+                                alternate = index
+                                triallelic = True
+
+                    if not found and alternate != -1:
+                        if triallelic:
+                            print('Achtung: %s triallelic variant %s:%i%s/%s reverse matched with %s:%i%s/%s'%(phenotype,chr,pos,allele1,allele2, variants[alternate].chr, variants[alternate].pos, variants[alternate].allele1, variants[alternate].allele2))
                         index = alternate
                         genos = genotypes[index*len(cases):(index+1)*len(cases)]
                         for i in range(len(genos)):
@@ -266,28 +295,59 @@ class AIDataset(Dataset):
 
                         data += genos
                         added[index] = True
+
+                        if allele1 == '!':
+                            allele1  == variants[index].allele2
+                        elif allele2 == '!':
+                            allele2 = variants[index].allele1
+
                         variants[index].allele1 = allele1
                         variants[index].allele2 = allele2
                         variants[index].maf = 1-variants[index].maf
                         self.variants.append(variants[index])
-                    elif match_renamed_variant and renamed_allele1 != -1 and renamed_allele2 != -1:
-                        index = renamed_allele1
-                        print('Achtung: %s variant %s:%d %s/%s (maf=%.2f) alternate %s/! (maf=%.2f) is being used!'%(phenotype,chr,pos,allele1,allele2,maf,variants[index].allele1,variants[index].maf ))
-                        data += genotypes[index*len(cases):(index+1)*len(cases)]
-                        found = True
-                        added[index] = True
-                        variants[index].allele1 = allele1
-                        variants[index].allele2 = allele2
-                        self.variants.append(variants[index])
-                    else:
+                    elif not found:
                         print('Warning: %s variant %s:%d %s/%s not found, this could reduce prediction accuracy'%(phenotype,chr,pos,allele1,allele2))
                         missing_variants.write('%s\t%d\t%s\t%s\n'%(chr,pos,allele1,allele2))
                         missing += 1
                         if not self.train_mode:
                             data += [-1]*len(cases)
                             self.variants.append(Variant(None,chr,pos,allele1,allele2))
-            specific_variants.close()
-            missing_variants.close()
+
+#                    if alternate != -1:
+#                        index = alternate
+#                        genos = genotypes[index*len(cases):(index+1)*len(cases)]
+#                        for i in range(len(genos)):
+#                            g = genos[i]
+
+#                            if g == 0:
+#                                genos[i] = 2
+#                            elif g == 2:
+#                                genos[i] = 0
+
+#                        data += genos
+#                        added[index] = True
+#                        variants[index].allele1 = allele1
+#                        variants[index].allele2 = allele2
+#                        variants[index].maf = 1-variants[index].maf
+#                        self.variants.append(variants[index])
+#                    elif match_renamed_variant and renamed_allele1 != -1 and renamed_allele2 != -1:
+#                        index = renamed_allele1
+#                        print('Achtung: %s variant %s:%d %s/%s (maf=%.2f) alternate %s/! (maf=%.2f) is being used!'%(phenotype,chr,pos,allele1,allele2,maf,variants[index].allele1,variants[index].maf ))
+#                        data += genotypes[index*len(cases):(index+1)*len(cases)]
+#                        found = True
+#                        added[index] = True
+#                        variants[index].allele1 = allele1
+#                        variants[index].allele2 = allele2
+#                        self.variants.append(variants[index])
+#                    else:
+#                        print('Warning: %s variant %s:%d %s/%s not found, this could reduce prediction accuracy'%(phenotype,chr,pos,allele1,allele2))
+#                        missing_variants.write('%s\t%d\t%s\t%s\n'%(chr,pos,allele1,allele2))
+#                        missing += 1
+#                        if not self.train_mode:
+#                            data += [-1]*len(cases)
+#                            self.variants.append(Variant(None,chr,pos,allele1,allele2))
+#            specific_variants.close()
+#            missing_variants.close()
 
             print('Found %i/%i (%.2f%%) specified variants in dataset'%(len(self.variants)-missing,len(self.variants), (len(self.variants)-missing)*100/len(self.variants)))
             del(genotypes)
@@ -853,8 +913,9 @@ class DeepPhenoat:
                                 FP = FP + 1
 
                 vlLoss.append(epLoss/counter)
-                accuracy = ((TP/(TP+FN))+(TN/(TN+FP)))/2
-                #accuracy = (TP+TN)/(TP+TN+FP+FN)
+                accuracy = 0
+                if (TP+FN) > 0 and (TN+FP) > 0:
+                    accuracy = ((TP/(TP+FN))+(TN/(TN+FP)))/2
 
                 if epoch == 0:
                     initial_accuracy = accuracy
@@ -1134,8 +1195,9 @@ class DeepPhenoat:
                                 elif x_classified[index] == 1:
                                     FP = FP + 1
 
-                #accuracy = (TP+TN)/(TP+TN+FP+FN)
-                accuracy = ((TP/(TP+FN))+(TN/(TN+FP)))/2
+                accuracy = 0
+                if (TP+FN) > 0 and (TN+FP) > 0:
+                    accuracy = ((TP/(TP+FN))+(TN/(TN+FP)))/2
                 vlLoss.append(epLoss/counter)
 
                 if epoch == 0:
