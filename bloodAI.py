@@ -1521,7 +1521,8 @@ class DeepPhenoat:
                         header = False
                         continue
                     items = line.rstrip().split('\t')
-                    skip_mlp.append(items[0])
+                    if len(items) > 2 and int(items[1]) > 0 and int(items[2]) > 0:
+                        skip_mlp.append(items[0])
                 evaluation.close()
             if MLP:
                 print('MLP resuming after: ')
@@ -1534,7 +1535,8 @@ class DeepPhenoat:
                         header = False
                         continue
                     items = line.rstrip().split('\t')
-                    skip_aec.append(items[0])
+                    if len(items) > 2 and int(items[1]) > 0 and int(items[2]) > 0:
+                        skip_aec.append(items[0])
                 evaluation.close()
 
         for line in file:
