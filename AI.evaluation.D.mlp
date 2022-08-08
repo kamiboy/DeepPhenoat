@@ -1,0 +1,2 @@
+phenotype	TP	TN	FP	FN	recall	specificity	PPV	NPV	accuracy	Fscore	cases	variants	(+)rate
+D	17717	4563	16	14	0.999210	0.996506	0.999098	0.996941	0.998655	0.999154	111667	524	0.794863
