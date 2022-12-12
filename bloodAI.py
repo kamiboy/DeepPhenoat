@@ -349,7 +349,7 @@ class AIDataset(Dataset):
 #            specific_variants.close()
 #            missing_variants.close()
 
-            print('Found %i/%i (%.2f%%) specified variants in dataset'%(len(self.variants)-missing,len(self.variants), (len(self.variants)-missing)*100/len(self.variants)))
+            print('Found %i/%i (%.2f%%) specified variants in dataset'%(len(self.variants),len(self.variants)+missing, len(self.variants)*100/(len(self.variants)+missing)))
             del(genotypes)
             self.cases = cases
             self.data = np.array(data,dtype='int8')
