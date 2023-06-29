@@ -1,13 +1,13 @@
 # DeepPhenoat
-The python script bloodAI.py should be run using python version 3.
+The python script DeepPhenoat.py should be run using python version 3.
 It requires several modules, such as numpy and torch.
-It uses a module called BEDBUG for loading genotypes from bed/bim/fam files. This module is developed by me and included for you. The module file bedbug.py should be placed in the same folder as bloodAI.py
+It uses a module called BEDBUG for loading genotypes from bed/bim/fam files. This module is developed by me and included for you. The module file bedbug.py should be placed in the same folder as DeepPhenoat.py
 
-It is best to run bloodAI.py using the following command: 
-python -u bloodAI.py | tee AI.log
+It is best to run DeepPhenoat.py using the following command: 
+python -u DeepPhenoat.py | tee AI.log
 This way it will print out progress to the terminal, as well as save all printed output into the log file AI.log. In case anything goes wrong or there is need for any tweaks I it is crucial that I receive this file as it contains crucial diagnostics information to help me track down any potential issues. 
 
-There are a number of variables in the start of bloodAI.py file that needs to be set according to your local environment.
+There are a number of variables in the start of DeepPhenoat.py file that needs to be set according to your local environment.
 
 These include the work folder "workdir" which is where the program expects to find all necessary data, except for genotypes.
 The genotype folder "snpdir" is where the program expects to find all bed/bim/fam genotype files.
